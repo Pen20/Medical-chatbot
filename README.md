@@ -1,3 +1,4 @@
+# Build Medical Chatbot with LLMS, Langchain, Pinecone, Flask & AWS
 ### STEP 1 - Create a conda environment after opening the repository
 
 # To check whether I have conda: 
