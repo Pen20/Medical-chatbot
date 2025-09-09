@@ -124,3 +124,6 @@ open up localhost:
    - ECR_REPO
    - PINECONE_API_KEY
    - OPENAI_API_KEY
+   - EC2_HOST (Public IP or DNS of your EC2 instance)
+   - EC2_USER (EC2 username, typically 'ubuntu' for Ubuntu instances)
+   - EC2_SSH_KEY (Private SSH key to connect to EC2)
