@@ -38,6 +38,22 @@ jobs:
           ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
           IMAGE_TAG: latest
         run: |
+          # Validate required environment variables
+          if [ -z "$ECR_REGISTRY" ]; then
+            echo "ERROR: ECR_REGISTRY is empty or not set"
+            exit 1
+          fi
+          if [ -z "$ECR_REPOSITORY" ]; then
+            echo "ERROR: ECR_REPOSITORY is empty or not set"
+            exit 1
+          fi
+          
+          # Debug output
+          echo "ECR_REGISTRY: $ECR_REGISTRY"
+          echo "ECR_REPOSITORY: $ECR_REPOSITORY"
+          echo "IMAGE_TAG: $IMAGE_TAG"
+          echo "Full image name: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
           # Build and tag the Docker image
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
@@ -73,13 +89,33 @@ jobs:
 
       - name: Stop existing container
         run: |
-          # Stop and remove existing container if it exists
-          docker stop medical-chatbot || true
-          docker rm medical-chatbot || true
+          # Check if container exists and stop/remove it
+          if docker ps -a --format "table {{.Names}}" | grep -q "^medical-chatbot$"; then
+            echo "Stopping existing medical-chatbot container..."
+            docker stop medical-chatbot || true
+            echo "Removing existing medical-chatbot container..."
+            docker rm medical-chatbot || true
+          else
+            echo "No existing medical-chatbot container found."
+          fi
         continue-on-error: true
 
       - name: Run Docker Image to serve users
         run: |
+          # Validate that the image reference is not empty
+          IMAGE_REF="${{ needs.Continuous-Integration.outputs.image }}"
+          if [ -z "$IMAGE_REF" ]; then
+            echo "ERROR: Image reference is empty. Check the Continuous-Integration job outputs."
+            echo "Available outputs:"
+            echo "  image: ${{ needs.Continuous-Integration.outputs.image }}"
+            echo "  image-digest: ${{ needs.Continuous-Integration.outputs.image-digest }}"
+            exit 1
+          fi
+          
+          # Debug output
+          echo "Image reference: $IMAGE_REF"
+          
+          # Run the container
           docker run -d \
             --name medical-chatbot \
             --restart unless-stopped \
@@ -89,7 +125,7 @@ jobs:
             -e PINECONE_API_KEY="${{ secrets.PINECONE_API_KEY }}" \
             -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
             -p 8080:8080 \
-            "${{ needs.Continuous-Integration.outputs.image }}"
+            "$IMAGE_REF"
 
       - name: Verify deployment
         run: |
