@@ -3,22 +3,24 @@ name: Deploy Medical Chatbot Application to AWS ECR and EC2
 on:
   push:
     branches: [main]
-  workflow_dispatch:  # Allow manual triggering
+  workflow_dispatch: # allow manual triggering
 
 env:
   AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
 
 jobs:
   Continuous-Integration:
+    name: Build and Push Docker Image to ECR
     runs-on: ubuntu-latest
     outputs:
       image: ${{ steps.build-image.outputs.image }}
-      image-digest: ${{ steps.build-image.outputs.digest }}
 
     steps:
-      - name: Checkout
+      # 1️⃣ Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      # 2️⃣ Configure AWS credentials
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -27,111 +29,97 @@ jobs:
           aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
           mask-aws-account-id: false
 
+      # 3️⃣ Login to ECR
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag, and push image to Amazon ECR
+      # 4️⃣ Setup Docker buildx for caching & multi-arch builds
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 5️⃣ Cache Docker layers
+      - name: Cache Docker layers
+        uses: actions/cache@v4
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+
+      # 6️⃣ Build, tag, and push image to ECR
+      - name: Build and push Docker image
         id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
           ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
           IMAGE_TAG: latest
         run: |
-          # Validate required environment variables
-          if [ -z "$ECR_REGISTRY" ]; then
-            echo "ERROR: ECR_REGISTRY is empty or not set"
-            exit 1
-          fi
-          if [ -z "$ECR_REPOSITORY" ]; then
-            echo "ERROR: ECR_REPOSITORY is empty or not set"
-            exit 1
-          fi
-          
-          # Debug output
           echo "ECR_REGISTRY: $ECR_REGISTRY"
           echo "ECR_REPOSITORY: $ECR_REPOSITORY"
           echo "IMAGE_TAG: $IMAGE_TAG"
-          echo "Full image name: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
-          
-          # Build and tag the Docker image
+
+          # Build Docker image
           docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
-          
-          # Push both tags
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+
+          # Push both tags to ECR
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-          
-          # Output the image name for the deployment job
+
+          # Save output for next job
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "digest=$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" >> $GITHUB_OUTPUT
 
   Continuous-Deployment:
+    name: Deploy Docker Image on EC2
     needs: Continuous-Integration
     runs-on: ubuntu-latest
-    environment: production  # Add environment protection
-    
+    environment: production
+
     steps:
-      - name: Checkout
+      # 1️⃣ Checkout code (optional, for reference)
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v4
+      # 2️⃣ SSH into EC2 and deploy container
+      - name: Deploy to EC2 via SSH
+        uses: appleboy/ssh-action@v0.1.10
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
-          mask-aws-account-id: false
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "Deploying Medical Chatbot container on EC2..."
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Stop existing container
-        run: |
-          # Check if container exists and stop/remove it
-          if docker ps -a --format "table {{.Names}}" | grep -q "^medical-chatbot$"; then
-            echo "Stopping existing medical-chatbot container..."
+            # Stop and remove any existing container
             docker stop medical-chatbot || true
-            echo "Removing existing medical-chatbot container..."
             docker rm medical-chatbot || true
-          else
-            echo "No existing medical-chatbot container found."
-          fi
-        continue-on-error: true
 
-      - name: Run Docker Image to serve users
-        run: |
-          # Validate that the image reference is not empty
-          IMAGE_REF="${{ needs.Continuous-Integration.outputs.image }}"
-          if [ -z "$IMAGE_REF" ]; then
-            echo "ERROR: Image reference is empty. Check the Continuous-Integration job outputs."
-            echo "Available outputs:"
-            echo "  image: ${{ needs.Continuous-Integration.outputs.image }}"
-            echo "  image-digest: ${{ needs.Continuous-Integration.outputs.image-digest }}"
-            exit 1
-          fi
-          
-          # Debug output
-          echo "Image reference: $IMAGE_REF"
-          
-          # Run the container
-          docker run -d \
-            --name medical-chatbot \
-            --restart unless-stopped \
-            -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
-            -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
-            -e AWS_DEFAULT_REGION="${{ secrets.AWS_DEFAULT_REGION }}" \
-            -e PINECONE_API_KEY="${{ secrets.PINECONE_API_KEY }}" \
-            -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
-            -p 8080:8080 \
-            "$IMAGE_REF"
+            # Pull the latest image from ECR
+            docker pull ${{ needs.Continuous-Integration.outputs.image }}
 
+            # Run the container
+            docker run -d \
+              --name medical-chatbot \
+              --restart unless-stopped \
+              -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
+              -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+              -e AWS_DEFAULT_REGION="${{ secrets.AWS_DEFAULT_REGION }}" \
+              -e PINECONE_API_KEY="${{ secrets.PINECONE_API_KEY }}" \
+              -p 8080:8080 \
+              ${{ needs.Continuous-Integration.outputs.image }}
+
+            echo "✅ Deployment complete."
+
+      # 3️⃣ Optional: Health check
       - name: Verify deployment
-        run: |
-          # Wait for the container to start
-          sleep 30
-          # Check if container is running
-          docker ps | grep medical-chatbot
-          # Basic health check (adjust URL as needed)
-          curl -f http://localhost:8080/ || exit 1
+        uses: appleboy/ssh-action@v0.1.10
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "⏳ Checking container health..."
+            sleep 20
+            docker ps | grep medical-chatbot && echo "✅ Container running successfully!"
+            curl -f http://localhost:8080/ || echo "⚠️ Health check failed (verify app manually)."
