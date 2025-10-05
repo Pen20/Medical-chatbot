@@ -1,0 +1,137 @@
+name: Deploy Medical Chatbot Application to AWS ECR and EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:  # Allow manual triggering
+
+env:
+  AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+
+jobs:
+  Continuous-Integration:
+    runs-on: ubuntu-latest
+    outputs:
+      image: ${{ steps.build-image.outputs.image }}
+      image-digest: ${{ steps.build-image.outputs.digest }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          mask-aws-account-id: false
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ secrets.ECR_REPO }}
+          IMAGE_TAG: latest
+        run: |
+          # Validate required environment variables
+          if [ -z "$ECR_REGISTRY" ]; then
+            echo "ERROR: ECR_REGISTRY is empty or not set"
+            exit 1
+          fi
+          if [ -z "$ECR_REPOSITORY" ]; then
+            echo "ERROR: ECR_REPOSITORY is empty or not set"
+            exit 1
+          fi
+          
+          # Debug output
+          echo "ECR_REGISTRY: $ECR_REGISTRY"
+          echo "ECR_REPOSITORY: $ECR_REPOSITORY"
+          echo "IMAGE_TAG: $IMAGE_TAG"
+          echo "Full image name: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+          
+          # Build and tag the Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
+          
+          # Push both tags
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
+          
+          # Output the image name for the deployment job
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "digest=$ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  Continuous-Deployment:
+    needs: Continuous-Integration
+    runs-on: ubuntu-latest
+    environment: production  # Add environment protection
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_DEFAULT_REGION }}
+          mask-aws-account-id: false
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Stop existing container
+        run: |
+          # Check if container exists and stop/remove it
+          if docker ps -a --format "table {{.Names}}" | grep -q "^medical-chatbot$"; then
+            echo "Stopping existing medical-chatbot container..."
+            docker stop medical-chatbot || true
+            echo "Removing existing medical-chatbot container..."
+            docker rm medical-chatbot || true
+          else
+            echo "No existing medical-chatbot container found."
+          fi
+        continue-on-error: true
+
+      - name: Run Docker Image to serve users
+        run: |
+          # Validate that the image reference is not empty
+          IMAGE_REF="${{ needs.Continuous-Integration.outputs.image }}"
+          if [ -z "$IMAGE_REF" ]; then
+            echo "ERROR: Image reference is empty. Check the Continuous-Integration job outputs."
+            echo "Available outputs:"
+            echo "  image: ${{ needs.Continuous-Integration.outputs.image }}"
+            echo "  image-digest: ${{ needs.Continuous-Integration.outputs.image-digest }}"
+            exit 1
+          fi
+          
+          # Debug output
+          echo "Image reference: $IMAGE_REF"
+          
+          # Run the container
+          docker run -d \
+            --name medical-chatbot \
+            --restart unless-stopped \
+            -e AWS_ACCESS_KEY_ID="${{ secrets.AWS_ACCESS_KEY_ID }}" \
+            -e AWS_SECRET_ACCESS_KEY="${{ secrets.AWS_SECRET_ACCESS_KEY }}" \
+            -e AWS_DEFAULT_REGION="${{ secrets.AWS_DEFAULT_REGION }}" \
+            -e PINECONE_API_KEY="${{ secrets.PINECONE_API_KEY }}" \
+            -e OPENAI_API_KEY="${{ secrets.OPENAI_API_KEY }}" \
+            -p 8080:8080 \
+            "$IMAGE_REF"
+
+      - name: Verify deployment
+        run: |
+          # Wait for the container to start
+          sleep 30
+          # Check if container is running
+          docker ps | grep medical-chatbot
+          # Basic health check (adjust URL as needed)
+          curl -f http://localhost:8080/ || exit 1
